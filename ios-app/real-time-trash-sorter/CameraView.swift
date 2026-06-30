@@ -16,45 +16,60 @@ struct CameraView: View {
     @State private var baseZoom: CGFloat = 1.0
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-            if camera.status == .denied || camera.status == .failed {
-                CameraUnavailableView()
-            } else {
-                CameraPreviewView(session: camera.session)
+                if camera.status == .denied || camera.status == .failed {
+                    CameraUnavailableView()
+                } else {
+                    CameraPreviewView(session: camera.session)
+                        .ignoresSafeArea()
+                        .gesture(zoomGesture)
+
+                    // Dim the live feed while an item is being inspected.
+                    Color.black
+                        .opacity(model.phase == .idle ? 0 : 0.55)
+                        .ignoresSafeArea()
+                        .animation(.easeInOut(duration: 0.3), value: model.phase)
+
+                    captureOverlay
+
+                    controlsOverlay
+                }
+
+                // Shutter flash
+                Color.white
+                    .opacity(shutterFlash ? 1 : 0)
                     .ignoresSafeArea()
-                    .gesture(zoomGesture)
+                    .allowsHitTesting(false)
 
-                // Dim the live feed while an item is being inspected.
-                Color.black
-                    .opacity(model.phase == .idle ? 0 : 0.55)
-                    .ignoresSafeArea()
-                    .animation(.easeInOut(duration: 0.3), value: model.phase)
-
-                captureOverlay
-
-                controlsOverlay
+                // Transient error toast
+                if let errorMessage = model.errorMessage {
+                    errorToast(errorMessage)
+                }
             }
-
-            // Shutter flash
-            Color.white
-                .opacity(shutterFlash ? 1 : 0)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-
-            // Transient error toast
-            if let errorMessage = model.errorMessage {
-                errorToast(errorMessage)
+            .preferredColorScheme(.dark)
+            .statusBarHidden()
+            .task { await camera.configure() }
+            .onDisappear { camera.stop() }
+            .sensoryFeedback(.impact(weight: .medium), trigger: model.captureFeedbackTrigger)
+            .sensoryFeedback(.success, trigger: model.resultFeedbackTrigger)
+            .animation(.easeInOut(duration: 0.25), value: model.errorMessage)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        cycleFlashMode()
+                    } label: {
+                        Image(systemName: flashSymbol)
+                            .foregroundStyle(camera.flashMode == .on ? .yellow : .primary)
+                            .contentTransition(.symbolEffect(.replace))
+                    }
+                    .accessibilityLabel("Blitz: \(flashAccessibilityValue)")
+                }
             }
+            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
         }
-        .preferredColorScheme(.dark)
-        .statusBarHidden()
-        .task { await camera.configure() }
-        .onDisappear { camera.stop() }
-        .sensoryFeedback(.impact(weight: .medium), trigger: model.captureFeedbackTrigger)
-        .sensoryFeedback(.success, trigger: model.resultFeedbackTrigger)
-        .animation(.easeInOut(duration: 0.25), value: model.errorMessage)
     }
 
     // MARK: - Capture / result overlay
@@ -97,12 +112,6 @@ struct CameraView: View {
 
     private var controlsOverlay: some View {
         VStack {
-            HStack {
-                Spacer()
-                flashButton
-            }
-            .padding(.horizontal, 24)
-
             Spacer()
 
             if zoomPresets.count > 1 {
@@ -130,32 +139,17 @@ struct CameraView: View {
         .animation(.easeInOut(duration: 0.25), value: model.phase)
     }
 
-    private var flashButton: some View {
-        Button {
-            cycleFlashMode()
-        } label: {
-            Image(systemName: flashSymbol)
-                .font(.system(size: 20, weight: .semibold))
-                .frame(width: 48, height: 48)
-                .foregroundStyle(camera.flashMode == .on ? .yellow : .white)
-                .background(.ultraThinMaterial, in: Circle())
-                .contentTransition(.symbolEffect(.replace))
-        }
-        .accessibilityLabel("Blitz: \(flashAccessibilityValue)")
-    }
-
     private var switchCameraButton: some View {
         Button {
             withAnimation(.snappy) { camera.switchCamera() }
         } label: {
             Image(systemName: "arrow.triangle.2.circlepath.camera.fill")
-                .font(.system(size: 22, weight: .semibold))
-                .frame(width: 52, height: 52)
-                .foregroundStyle(.white)
-                .background(.ultraThinMaterial, in: Circle())
-                .symbolEffect(.bounce, value: camera.cameraPosition)
+                .font(.title2)
+                .padding(10)
         }
         .accessibilityLabel("Kamera wechseln")
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
     }
 
     private func errorToast(_ message: String) -> some View {
@@ -265,42 +259,36 @@ private struct ShutterButton: View {
 
 // MARK: - Zoom control
 
-/// A capsule of quick-zoom presets. The active preset shows the live zoom value
-/// (e.g. "1.5×") so it stays in sync with the pinch gesture.
+/// A segmented zoom-preset picker. The current-value label tracks the live zoom
+/// (e.g. "1.5×") when the user pinch-zooms between presets.
 private struct ZoomControl: View {
     let current: CGFloat
     let presets: [CGFloat]
     let onSelect: (CGFloat) -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
+        Picker(
+            selection: Binding(get: { activePreset }, set: { onSelect($0) })
+        ) {
             ForEach(presets, id: \.self) { preset in
-                let isActive = preset == activePreset
-                Button {
-                    onSelect(preset)
-                } label: {
-                    Text(label(for: preset, isActive: isActive))
-                        .font(.system(size: isActive ? 15 : 13, weight: .semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(isActive ? .yellow : .white)
-                        .frame(width: 44, height: 36)
-                        .background(.white.opacity(isActive ? 0.18 : 0), in: Circle())
-                }
-                .buttonStyle(.plain)
+                Text("\(Int(preset))×").tag(preset)
             }
+        } label: {
+            Text("Zoom")
+        } currentValueLabel: {
+            Text(currentZoomLabel)
         }
-        .padding(5)
-        .background(.ultraThinMaterial, in: Capsule())
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(maxWidth: 160)
         .animation(.snappy, value: current)
     }
 
-    /// The highest preset at or below the current zoom factor.
     private var activePreset: CGFloat {
         presets.last(where: { current >= $0 - 0.05 }) ?? presets.first ?? 1
     }
 
-    private func label(for preset: CGFloat, isActive: Bool) -> String {
-        guard isActive else { return "\(Int(preset))×" }
+    private var currentZoomLabel: String {
         let rounded = (current * 10).rounded() / 10
         return rounded == rounded.rounded()
             ? "\(Int(rounded))×"
