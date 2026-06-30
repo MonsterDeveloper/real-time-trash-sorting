@@ -9,11 +9,18 @@
 import AVFoundation
 import SwiftUI
 
+enum AppMode {
+    case trashSorting
+    case pfandClassifier
+}
+
 struct CameraView: View {
     @State private var camera = CameraManager()
     @State private var model = CaptureViewModel()
+    @State private var pfandModel = PfandViewModel()
     @State private var shutterFlash = false
     @State private var baseZoom: CGFloat = 1.0
+    @State private var appMode: AppMode = .trashSorting
 
     var body: some View {
         NavigationStack {
@@ -27,13 +34,22 @@ struct CameraView: View {
                         .ignoresSafeArea()
                         .gesture(zoomGesture)
 
-                    // Dim the live feed while an item is being inspected.
+                    // Dim the live feed while processing.
                     Color.black
-                        .opacity(model.phase == .idle ? 0 : 0.55)
+                        .opacity(dimOpacity)
                         .ignoresSafeArea()
-                        .animation(.easeInOut(duration: 0.3), value: model.phase)
+                        .animation(.easeInOut(duration: 0.3), value: dimOpacity)
 
-                    captureOverlay
+                    // Trash sorting: captured image + result card.
+                    if appMode == .trashSorting {
+                        captureOverlay
+                    }
+
+                    // Pfand: instruction text, thumbnail, result card.
+                    if appMode == .pfandClassifier {
+                        PfandOverlayView(model: pfandModel, camera: camera)
+                            .transition(.opacity)
+                    }
 
                     controlsOverlay
                 }
@@ -45,8 +61,8 @@ struct CameraView: View {
                     .allowsHitTesting(false)
 
                 // Transient error toast
-                if let errorMessage = model.errorMessage {
-                    errorToast(errorMessage)
+                if let message = activeErrorMessage {
+                    errorToast(message)
                 }
             }
             .preferredColorScheme(.dark)
@@ -55,13 +71,35 @@ struct CameraView: View {
             .onDisappear { camera.stop() }
             .sensoryFeedback(.impact(weight: .medium), trigger: model.captureFeedbackTrigger)
             .sensoryFeedback(.success, trigger: model.resultFeedbackTrigger)
-            .animation(.easeInOut(duration: 0.25), value: model.errorMessage)
+            .sensoryFeedback(.impact(weight: .medium), trigger: pfandModel.captureFeedbackTrigger)
+            .sensoryFeedback(.success, trigger: pfandModel.resultFeedbackTrigger)
+            .animation(.easeInOut(duration: 0.25), value: activeErrorMessage)
+            .onChange(of: appMode) { _, newMode in
+                if newMode == .trashSorting { pfandModel.reset() }
+            }
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        cycleFlashMode()
-                    } label: {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button { appMode = .trashSorting } label: {
+                        Image(systemName: "trash.fill")
+                            .frame(width: 28, height: 28)
+                    }
+                    .foregroundStyle(appMode == .trashSorting ? .primary : .tertiary)
+                    .accessibilityLabel("Abfall sortieren")
+
+                    Button { appMode = .pfandClassifier } label: {
+                        Image(systemName: "waterbottle.fill")
+                            .frame(width: 28, height: 28)
+                    }
+                    .foregroundStyle(appMode == .pfandClassifier ? .primary : .tertiary)
+                    .accessibilityLabel("Pfand erkennen")
+                }
+
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+
+                ToolbarItem(placement: .primaryAction) {
+                    Button { cycleFlashMode() } label: {
                         Image(systemName: flashSymbol)
+                            .frame(width: 28, height: 28)
                             .foregroundStyle(camera.flashMode == .on ? .yellow : .primary)
                             .contentTransition(.symbolEffect(.replace))
                     }
@@ -72,7 +110,30 @@ struct CameraView: View {
         }
     }
 
-    // MARK: - Capture / result overlay
+    // MARK: - Computed helpers
+
+    private var dimOpacity: Double {
+        switch appMode {
+        case .trashSorting:    model.phase == .idle ? 0 : 0.55
+        case .pfandClassifier: pfandModel.isProcessing ? 0.55 : 0
+        }
+    }
+
+    private var shutterVisible: Bool {
+        switch appMode {
+        case .trashSorting:    model.phase == .idle
+        case .pfandClassifier: pfandModel.canCapture
+        }
+    }
+
+    private var activeErrorMessage: String? {
+        switch appMode {
+        case .trashSorting:    model.errorMessage
+        case .pfandClassifier: pfandModel.errorMessage
+        }
+    }
+
+    // MARK: - Capture / result overlay (trash mode)
 
     @ViewBuilder
     private var captureOverlay: some View {
@@ -123,7 +184,7 @@ struct CameraView: View {
 
             HStack {
                 Spacer()
-                ShutterButton(isEnabled: model.phase == .idle) {
+                ShutterButton(isEnabled: shutterVisible) {
                     triggerCapture()
                 }
                 Spacer()
@@ -135,8 +196,8 @@ struct CameraView: View {
             .padding(.bottom, 24)
         }
         .padding(.vertical, 12)
-        .opacity(model.phase == .idle ? 1 : 0)
-        .animation(.easeInOut(duration: 0.25), value: model.phase)
+        .opacity(shutterVisible ? 1 : 0)
+        .animation(.easeInOut(duration: 0.25), value: shutterVisible)
     }
 
     private var switchCameraButton: some View {
@@ -170,14 +231,20 @@ struct CameraView: View {
     // MARK: - Actions
 
     private func triggerCapture() {
-        guard model.phase == .idle else { return }
-        // Quick white flash to mimic a shutter.
+        guard shutterVisible else { return }
+
         withAnimation(.easeOut(duration: 0.08)) { shutterFlash = true }
         Task {
             try? await Task.sleep(for: .milliseconds(90))
             withAnimation(.easeIn(duration: 0.25)) { shutterFlash = false }
         }
-        Task { await model.capture(using: camera) }
+
+        switch appMode {
+        case .trashSorting:
+            Task { await model.capture(using: camera) }
+        case .pfandClassifier:
+            pfandModel.onShutter(using: camera)
+        }
     }
 
     private var zoomGesture: some Gesture {
@@ -211,17 +278,17 @@ struct CameraView: View {
 
     private var flashSymbol: String {
         switch camera.flashMode {
-        case .off: "bolt.slash.fill"
+        case .off:  "bolt.slash.fill"
         case .auto: "bolt.badge.automatic.fill"
-        default: "bolt.fill"
+        default:    "bolt.fill"
         }
     }
 
     private var flashAccessibilityValue: String {
         switch camera.flashMode {
-        case .off: "Aus"
+        case .off:  "Aus"
         case .auto: "Automatisch"
-        default: "An"
+        default:    "An"
         }
     }
 }
@@ -298,8 +365,10 @@ private struct ZoomControl: View {
 
 // MARK: - Processing shimmer
 
-/// A light streak that sweeps across the captured image while inference runs.
-private struct ShimmerOverlay: View {
+/// A light streak that sweeps across an image while inference runs.
+struct ShimmerOverlay: View {
+    var cornerRadius: CGFloat = 28
+
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
@@ -316,7 +385,7 @@ private struct ShimmerOverlay: View {
             }
         }
         .blendMode(.plusLighter)
-        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .allowsHitTesting(false)
     }
 }
