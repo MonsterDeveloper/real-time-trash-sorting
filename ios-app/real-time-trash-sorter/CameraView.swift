@@ -80,7 +80,7 @@ struct CameraView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     Button { appMode = .trashSorting } label: {
-                        Image(systemName: "trash.fill")
+                        Image(systemName: "arrow.3.trianglepath")
                             .frame(width: 28, height: 28)
                     }
                     .foregroundStyle(appMode == .trashSorting ? .primary : .tertiary)
