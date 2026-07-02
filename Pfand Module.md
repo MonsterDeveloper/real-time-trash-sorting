@@ -1,10 +1,11 @@
-# Pfand Module — WIP Feature Report
+# Pfand Module — Feature Report
 
-> **Status:** Work in progress. Container detection (Photo 1) is shipped and validated.
-> The label-analysis runs (Photo 2) are partially built / planned. This document is the
-> single source of truth for the module's design, decisions, and current state.
+> **Status:** Container detection (Photo 1), OCR, barcode/Open Food Facts lookup, and
+> on-device LLM fusion (Photo 2, Runs 2–4) are all shipped. The one remaining piece is
+> the DPG-logo detector (Run 1) — still in progress, no trained model yet. This document
+> is the single source of truth for the module's design, decisions, and current state.
 >
-> **Last updated:** 2026-06-30
+> **Last updated:** 2026-07-02
 
 ---
 
@@ -37,10 +38,11 @@ Photo 1 — whole object in frame
 
 Photo 2 — label close-up
   ├─ Run 1: DPG Pfand-logo detector (CoreML/Vision)  .................. IN PROGRESS (pivoted)
-  ├─ Run 2: OCR — Apple Vision VNRecognizeTextRequest  ............... PLANNED
-  ├─ Run 3: Barcode — VNDetectBarcodesRequest → Open Food Facts  .... PLANNED
-  └─ Run 4: LLM aggregation — on-device System Language Model  ....... PLANNED
-             (structured signals primary + both raw images as context)
+  ├─ Run 2: OCR — Apple Vision RecognizeTextRequest  .................. DONE
+  ├─ Run 3: Barcode — DetectBarcodesRequest → Open Food Facts  ........ DONE
+  └─ Run 4: LLM aggregation — on-device Foundation Models framework  .. DONE
+             (structured signals primary; both raw images threaded through
+              for future image grounding — see caveat below)
                           │
                           ▼
         Final verdict → DETERMINISTIC Pfand amount (§7 amount table)
@@ -55,6 +57,13 @@ a confident detector based on a weaker visual read. The final **amount is determ
 verdict identifies the container/Pfand class, the amount comes from the fixed table in §7, not from the
 model's free generation.
 
+**Image-grounding caveat (as implemented):** we originally planned for Run 4 to also take both raw
+photos directly as LLM context, not just the text signals. `Prompt` only gains an image-attachment API
+in **iOS 27.0 beta**, and we are not raising the app's deployment target that high just for this — so
+today Run 4 fuses the *text* signals only (container type, OCR, barcode, Open Food Facts). Both images
+are already threaded through `PfandAggregator.aggregate(...)` so image grounding is a small follow-up
+once we're comfortable targeting iOS 27.
+
 ---
 
 ## 3. Status table
@@ -62,12 +71,12 @@ model's free generation.
 | # | Component | Stage | Status | Notes |
 |---|---|---|---|---|
 | — | Two-photo capture flow, camera, result UI | App | ✅ Done | `PfandViewModel`, `PfandView`, `CameraManager` |
-| A | **Container-type detection** (Photo 1) | Model + app | ✅ Done | YOLOv8n → CoreML, mAP@50 **0.978**; `ContainerDetector.swift` |
-| 1 | **DPG logo detection** (Photo 2) | Model + app | 🟡 In progress | ORB approach **abandoned** (see §5); pivoting to trained CoreML detector |
-| 2 | **OCR** of label text (Photo 2) | App | ⬜ Planned | `VNRecognizeTextRequest`, on-device, German printed text |
-| 3 | **Barcode + Open Food Facts** (Photo 2) | App + API | ⬜ Planned | `VNDetectBarcodesRequest` → OFF for product identity (no deposit field) |
-| 4 | **LLM aggregation** (Photo 2) | App | ⬜ Planned | On-device System Language Model (WWDC 2026), `@Generable`/`@Guide` |
-| — | Final verdict → deterministic amount | Logic | ⬜ Planned | Maps verdict to §7 amount table |
+| A | **Container-type detection** (Photo 1) | Model + app | ✅ Done | YOLOv8n → CoreML, mAP@50 **0.978**; `ContainerTypeObjectDetector.swift` |
+| 1 | **DPG logo detection** (Photo 2) | Model + app | 🟡 In progress | ORB approach **abandoned** (see §5); pivoting to trained CoreML detector — collecting logo/no-logo label photos now |
+| 2 | **OCR** of label text (Photo 2) | App | ✅ Done | `RecognizeTextRequest`, on-device, German+English with Pfand vocabulary bias; `LabelOCR.swift` |
+| 3 | **Barcode + Open Food Facts** (Photo 2) | App + API | ✅ Done | `DetectBarcodesRequest` → OFF v3 for product identity (no deposit field); `LabelBarcode.swift`, `OpenFoodFactsClient.swift` |
+| 4 | **LLM aggregation** (Photo 2) | App | ✅ Done | On-device Foundation Models framework, `@Generable`/`@Guide`, rule-based fallback when unavailable/unsure; `PfandAggregator.swift` — text signals only for now (see §2 image-grounding caveat) |
+| — | Final verdict → deterministic amount | Logic | ✅ Done | `PfandAggregator.resolve(...)` maps verdict to the §7 amount table |
 | — | Cleanup: remove OpenCV-SPM dep + ORB matcher + logo reference assets | App | ⬜ Planned | Dead once Run 1 lands as CoreML |
 
 (Separate from this module: the **Trash-sorting** mode uses an image **classifier**, `TrashClassifier`,
@@ -91,9 +100,10 @@ confidence + bounding box.
     merge (~11k images, ~13.7k boxes) → stratified 80/10/10 split by majority class.
 - **Training config:** `epochs=80, imgsz=640, batch=32, patience=10`, resumable.
 - **Results (held-out test):** mAP@50 **0.978**, mAP@50-95 0.810; per-class AP@50 0.97–0.98.
-- **Export:** CoreML fp16 with embedded NMS (`format='coreml', half=True, nms=True`) → `.mlpackage`.
-- **App integration:** `ContainerDetector.swift` wraps `VNCoreMLModel` + `VNCoreMLRequest`, reads
-  `VNRecognizedObjectObservation`, returns `ContainerDetection { type, confidence, boundingBox }`.
+- **Export:** CoreML fp16 with embedded NMS (`format='coreml', half=True, nms=True`) → `.mlpackage`
+  (5.9 MB, `ContainerTypeDetector.mlpackage`).
+- **App integration:** `ContainerTypeObjectDetector.swift` wraps `VNCoreMLModel` + `VNCoreMLRequest`, reads
+  `VNRecognizedObjectObservation`, returns `ContainerTypeDetection { type, confidence, boundingBox }`.
   Rendered with `BoundingBoxOverlay` in `PfandView`.
 
 ---
@@ -148,42 +158,62 @@ localizes a small logo in a larger frame — the exact case ORB failed — and f
   stronger geometric aug. Watch **precision on the negatives-only test set** as the key metric.
 - **Export:** CoreML fp16 + NMS → `dpg_logo_detector.mlpackage`.
 
-**App integration (planned):** add `DPGLogoDetector.swift` mirroring `ContainerDetector`; output
-`DPGLogoDetection { found, confidence, boundingBox }`; `found = topConfidence ≥ ~0.5`; reuse
-`BoundingBoxOverlay`. Remove the ORB/OpenCV path.
+**App integration (planned):** add `DPGLogoDetector.swift` mirroring `ContainerTypeObjectDetector.swift`;
+output `DPGLogoDetection { found, confidence, boundingBox }`; `found = topConfidence ≥ ~0.5`; reuse
+`BoundingBoxOverlay`. Remove the ORB/OpenCV path. The signal already has a placeholder slot in
+`PfandAggregator`'s prompt-builder (`"DPG Pfand logo: (detection not implemented)"`), so wiring the real
+detector in is a matter of computing it in `PfandViewModel.captureLabelPhoto` and passing it into
+`PfandAggregator.aggregate(...)` alongside the other signals.
 
 ---
 
-## 6. Runs 2–4 — Label analysis (planned)
+## 6. Runs 2–4 — Label analysis ✅ DONE
 
-### Run 2 — OCR (`VNRecognizeTextRequest`)
-On-device Apple Vision text recognition on the label close-up. **Free, private, no network**, decent on
-printed German text. Targets the explicit, high-contrast cues: **"Einweg" / "Einwegpfand" / "0,25 €" /
-"Mehrweg" / "Pfand"**. Often the single most learnable, reliable signal when present (a printed
-"Einwegpfand 0,25 €" is near-conclusive).
+### Run 2 — OCR (`LabelOCR.swift`, `RecognizeTextRequest`)
+On-device Apple Vision text recognition (accurate mode, language correction on) on the label close-up.
+**Free, private, no network.** Recognition languages are `de-DE` + `en-US`, biased with a custom Pfand/
+recycling vocabulary (`Pfand`, `Einweg`, `Mehrweg`, `Einwegflasche`, `Mehrwegflasche`, `Pfandflasche`,
+`Pfandsystem`, `Pfandautomat`, `DPG`, `PET`) so short, high-value tokens like "0,25 €" or "Einwegpfand"
+are read reliably. Output is a flat list of recognized lines, fed into both the LLM prompt (Run 4) and
+the rule-based fallback.
 
-### Run 3 — Barcode (`VNDetectBarcodesRequest`) → Open Food Facts
-Natively decode EAN-13/EAN-8/UPC-A/Code128/QR on a still image (fits the two-photo flow better than
-continuous scanning), on-device and first-party. Feed the decoded **GTIN** to the Open Food Facts REST API
-(`/api/v2/product/{barcode}.json`).
-**Re-stated finding:** OFF has **no deposit field** and sparse/unreliable German Pfand tags, so this run
-contributes **product identity** (name, brand, category) as **corroborating evidence** — e.g. "0.5 L PET
-Coca-Cola bottle" reinforcing the container-type and logo signals — **not** a standalone Pfand answer.
-Compliance: ODbL (attribution + share-alike), descriptive `User-Agent` (`AppName/Version (email)`),
-"1 API call = 1 real scan", prefer a cached local dump over hammering the API.
+### Run 3 — Barcode (`LabelBarcode.swift`, `DetectBarcodesRequest`) → Open Food Facts (`OpenFoodFactsClient.swift`)
+Decodes `.ean13, .ean8, .upce, .code128, .qr` on the label still image, on-device and first-party. Only a
+genuine product-identity symbology (EAN-13/EAN-8/UPC-E) triggers an Open Food Facts lookup — a QR code or
+Code128 payload on a Pfand label isn't a GTIN, so those are surfaced for debugging but never looked up.
+The OFF call hits the **v3** API (`/api/v3/product/{barcode}.json`, `fields=product_name,brands,quantity,
+packagings,categories_tags,image_front_small_url,code`, `lc=de`), tolerates a 404 as a normal "product not
+found" outcome, and returns `nil` (not an error) when the barcode simply isn't in OFF's catalog.
+**Re-stated finding:** OFF has **no deposit field**, so this run contributes **product identity** (name,
+brand, quantity, packaging materials, categories) as **corroborating evidence** for Run 4 — e.g. "0.5 L PET
+Coca-Cola bottle" reinforcing the container-type signal — **not** a standalone Pfand answer. Compliance:
+ODbL attribution shown in the result UI ("Produktdaten: Open Food Facts, ODbL"), descriptive `User-Agent`
+(`RealTimeTrashSorter/1.0 (me@ctoofeverything.dev)`).
 
-### Run 4 — LLM aggregation (on-device System Language Model)
-WWDC 2026: Apple's on-device model now **accepts images directly** and supports `@Generable`/`@Guide`
-guided generation for **type-safe structured output**, free and offline on iOS 26+ Apple-Intelligence
-devices. This run **fuses** the structured signals from Runs A/1/2/3 into a final verdict, optionally
-also taking **both raw images** as additional context.
+### Run 4 — LLM aggregation (`PfandAggregator.swift`, on-device Foundation Models framework)
+Apple's on-device Foundation Models framework (`FoundationModels`, iOS 26+ Apple-Intelligence devices)
+supports `@Generable`/`@Guide` guided generation for **type-safe structured output**, free and offline.
+This run fuses the structured signals from Runs A/2/3 (Run 1's logo signal is currently a placeholder,
+see §5) into a final verdict.
 
-- **Primary grounding = structured signals.** Raw images are corroboration for missing/low-confidence/
-  contradictory cases only (per the principle in §2).
-- **Output is structured** (e.g. `{ isPfand: Bool, system: einweg|mehrweg|none, containerType, confidence,
-  rationale }`).
-- **Amount is deterministic:** once the verdict fixes the Pfand class, the app maps it to the §7 amount
-  table (Einweg → €0.25; Mehrweg → range), rather than letting the model invent a number.
+- **Schema:** `PfandVerdict { system: einweg|mehrweg|none|unsure, confidence: high|medium|low, rationale: String }`
+  — a `@Generable` struct with `@Guide`-annotated fields. The LLM session runs with greedy sampling
+  (`temperature: 0.0`) and explicit system instructions encoding the VerpackG §31 decision rules (e.g. cans
+  and PET bottles default to **einweg** unless explicit Mehrweg wording is present; glass bottles default
+  to **mehrweg** when unmarked, since genuine Mehrweg glass is normally the *unmarked* case in practice).
+- **Primary grounding = structured signals.** Per the design principle in §2, a confident detector/OCR
+  signal always outranks the model's own read. Raw images are corroboration only, and — per the caveat in
+  §2 — aren't actually passed to the model yet (no image-attachment API below iOS 27).
+- **Fallback path:** if `SystemLanguageModel.default` is unavailable (Apple Intelligence disabled, device
+  ineligible, model still downloading) or the LLM itself returns `confidence: low` / `system: unsure`, the
+  aggregator falls back to `PfandAggregator.ruleFallback(...)` — a small deterministic classifier over the
+  same container-type + OCR signals, mirroring the LLM's own decision rules, so the app always resolves to
+  a concrete verdict. The UI surfaces this as an "unsicher" badge plus the reason (either the availability
+  message or "LLM-Verdikt unsicher — Regel-Fallback verwendet.").
+- **Amount is deterministic:** `PfandAggregator.resolve(...)` maps the verdict's `system` onto a fixed
+  table — never generated by the model — matching §7: `einweg` → "0,25 €" / any retailer selling that
+  material; `mehrweg` → "ca. 0,08–0,15 €" / only matching retailers; `none` → no deposit; `unsure` → both
+  figures shown with a prompt to check the DPG logo or ask in-store.
 
 ---
 
@@ -231,11 +261,18 @@ only viable primary path; RVMs themselves still ground truth on GTIN + DPG mark 
 - ORB/OpenCV feature matching **abandoned** (§5.1).
 - Structured signals are primary; on-device LLM is a fusion/tiebreak layer; **amount is deterministic**.
 - Reuse the container-detector training/export pipeline for the logo detector.
+- Verdict schema locked in as `PfandVerdict { system, confidence, rationale }` (§6, Run 4) with a
+  deterministic rule-based fallback for when the LLM is unavailable or unsure — implemented in
+  `PfandAggregator.swift`.
+- Image grounding for Run 4 (passing both photos into the LLM prompt) is deferred until we're willing to
+  raise the deployment target to iOS 27 beta, since that's the first `Prompt` API with image attachments.
 
 **Open questions / next steps**
-- Collect + annotate the DPG-logo dataset; build the synthetic-compositing generator (mostly drafted).
-- Decide the verdict schema (`@Generable` struct) and the confidence-fusion rules across the 4 runs.
-- Define fallback behavior when runs disagree (e.g. detector says "no logo" but OCR reads "Einwegpfand").
+- Collect + annotate the DPG-logo dataset; build the synthetic-compositing generator (mostly drafted) — in
+  progress now, see `DPG Logo Detector — Training Plan.md`.
+- Wire the trained DPG-logo detector into `PfandAggregator`'s signal block once it exists (currently a
+  placeholder string).
+- Revisit image grounding for Run 4 once targeting iOS 27 is acceptable.
 - Store-guidance (Stage 3): static VerpackG decision tree; optional OSM RVM overlay (with disclaimer).
 - Periodic review of regulatory drift (2022 plastics/cans, 2024 milk, EU PPWR Mehrweg obligations from 2030).
 
@@ -248,10 +285,16 @@ only viable primary path; RVMs themselves still ground truth on GTIN + DPG mark 
 ## 9. Relevant files
 
 - `ios-app/real-time-trash-sorter/PfandViewModel.swift` — two-photo state machine + run orchestration
-- `ios-app/real-time-trash-sorter/PfandView.swift` — instructions, thumbnails, result card, overlays
-- `ios-app/real-time-trash-sorter/ContainerDetector.swift` — Run A (CoreML/Vision)
+- `ios-app/real-time-trash-sorter/PfandView.swift` — instructions, thumbnails, result card, overlays, debug panel
+- `ios-app/real-time-trash-sorter/ContainerTypeObjectDetector.swift` — Run A (CoreML/Vision)
 - `ios-app/real-time-trash-sorter/ContainerTypeDetector.mlpackage` — trained container model
+- `ios-app/real-time-trash-sorter/LabelOCR.swift` — Run 2 (on-device OCR)
+- `ios-app/real-time-trash-sorter/LabelBarcode.swift` — Run 3 (on-device barcode decoding)
+- `ios-app/real-time-trash-sorter/OpenFoodFactsClient.swift` — Run 3 (Open Food Facts product lookup)
+- `ios-app/real-time-trash-sorter/PfandAggregator.swift` — Run 4 (LLM fusion, rule fallback, deterministic amount table)
 - `Container Type Detector.ipynb` — container training/export (template for the logo detector)
 - `Colab Notebook.ipynb` — (separate) trash-sorting classifier
+- `DPG Logo Detector — Training Plan.md` — companion build plan for Run 1 (data collection, synthetic
+  compositing, training, export)
 - _To remove:_ `DPGLogoFeatureMatcher.swift`, OpenCV-SPM dependency, `dpg_logo_*` reference assets
 - _To add:_ `DPGLogoDetector.swift`, `dpg_logo_detector.mlpackage`, logo training notebook

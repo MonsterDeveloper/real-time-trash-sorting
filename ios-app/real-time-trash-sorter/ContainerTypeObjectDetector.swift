@@ -1,5 +1,5 @@
 //
-//  ContainerTypeClassifier.swift
+//  ContainerTypeObjectDetector.swift
 //  real-time-trash-sorter
 //
 
@@ -9,7 +9,7 @@ import SwiftUI
 import UIKit
 import Vision
 
-private let log = Logger(subsystem: "dev.ctoofeverything.trash", category: "ContainerTypeClassifier")
+private let log = Logger(subsystem: "dev.ctoofeverything.trash", category: "ContainerTypeObjectDetector")
 
 enum ContainerType: String, CaseIterable, Sendable {
     case plasticBottle = "plastic_bottle"
@@ -46,13 +46,13 @@ enum ContainerType: String, CaseIterable, Sendable {
 
 }
 
-struct ContainerClassification: Sendable {
+struct ContainerTypeDetection: Sendable {
     let type: ContainerType
     let confidence: Double
     let boundingBox: CGRect
 }
 
-final class ContainerTypeClassifier: @unchecked Sendable {
+final class ContainerTypeObjectDetector: @unchecked Sendable {
     private let visionModel: VNCoreMLModel
 
     init() throws {
@@ -64,8 +64,8 @@ final class ContainerTypeClassifier: @unchecked Sendable {
         log.info("Output description: \(model.model.modelDescription.outputDescriptionsByName, privacy: .public)")
     }
 
-    nonisolated func classify(_ image: UIImage) async throws -> ContainerClassification {
-        log.info("classify() called — image size: \(image.size.width)×\(image.size.height), orientation: \(image.imageOrientation.rawValue)")
+    nonisolated func detect(_ image: UIImage) async throws -> ContainerTypeDetection {
+        log.info("detect() called — image size: \(image.size.width)×\(image.size.height), orientation: \(image.imageOrientation.rawValue)")
         guard let cgImage = image.cgImage else {
             log.error("Failed to get CGImage from UIImage")
             throw ClassifierError.badImage
@@ -99,7 +99,7 @@ final class ContainerTypeClassifier: @unchecked Sendable {
                         continuation.resume(throwing: ClassifierError.unknownLabel(topLabel.identifier))
                         return
                     }
-                    continuation.resume(returning: ContainerClassification(
+                    continuation.resume(returning: ContainerTypeDetection(
                         type: type,
                         confidence: Double(best.confidence),
                         boundingBox: best.boundingBox

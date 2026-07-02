@@ -6,6 +6,16 @@
 import Observation
 import SwiftUI
 
+/// Non-fatal errors from the individual detection stages, surfaced to the user
+/// alongside the result rather than silently swallowed.
+struct PfandDiagnostics: Sendable {
+    let ocrError: String?
+    let barcodeError: String?
+    let offError: String?
+
+    static let none = PfandDiagnostics(ocrError: nil, barcodeError: nil, offError: nil)
+}
+
 @Observable
 @MainActor
 final class PfandViewModel {
@@ -13,7 +23,7 @@ final class PfandViewModel {
         case awaitingBottlePhoto
         case awaitingLabelPhoto(UIImage)
         case processing(bottle: UIImage, label: UIImage)
-        case result(bottle: UIImage, label: UIImage, ContainerClassification)
+        case result(bottle: UIImage, label: UIImage, ContainerTypeDetection, LabelOCRResult, LabelBarcodeResult, OpenFoodFactsProduct?, PfandOutcome, PfandDiagnostics)
     }
 
     private(set) var step: Step = .awaitingBottlePhoto
@@ -21,13 +31,17 @@ final class PfandViewModel {
     private(set) var captureFeedbackTrigger = 0
     private(set) var resultFeedbackTrigger = 0
 
-    private let classifier = try? ContainerTypeClassifier()
+    private let detector = try? ContainerTypeObjectDetector()
+    private let ocr = LabelOCR()
+    private let barcode = LabelBarcode()
+    private let off = OpenFoodFactsClient()
+    private let aggregator = PfandAggregator()
 
     var bottleImage: UIImage? {
         switch step {
-        case .awaitingLabelPhoto(let img):        img
-        case .processing(let img, _):             img
-        case .result(let img, _, _):              img
+        case .awaitingLabelPhoto(let img):          img
+        case .processing(let img, _):               img
+        case .result(let img, _, _, _, _, _, _, _): img
         default: nil
         }
     }
@@ -108,24 +122,69 @@ final class PfandViewModel {
             step = .processing(bottle: bottleImage, label: labelImage)
         }
 
-        guard let classifier else {
+        guard let detector else {
             showError("Modell konnte nicht geladen werden.")
             return
         }
 
         do {
-            // Run inference on the first (bottle overview) image only.
-            async let classificationTask = classifier.classify(bottleImage)
+            // Run container type detection (bottle photo), OCR and barcode detection (label photo) concurrently.
+            async let detectionTask = detector.detect(bottleImage)
+            async let ocrTask = ocr.recognizeText(labelImage)
+            async let barcodeTask = barcode.detectBarcodes(labelImage)
             try? await Task.sleep(for: .milliseconds(950))
-            let classification = try await classificationTask
+            let detection = try await detectionTask
+
+            let ocrResult: LabelOCRResult
+            var ocrError: String?
+            do {
+                ocrResult = try await ocrTask
+            } catch {
+                ocrResult = .empty
+                ocrError = error.localizedDescription
+            }
+
+            let barcodeResult: LabelBarcodeResult
+            var barcodeError: String?
+            do {
+                barcodeResult = try await barcodeTask
+            } catch {
+                barcodeResult = .empty
+                barcodeError = error.localizedDescription
+            }
+
+            // OFF lookup depends on the decoded barcode, so it runs only after barcode detection
+            // resolves. Only GTIN symbologies (EAN-13/EAN-8/UPC-E) identify products — QR/Code128
+            // payloads on a Pfand label aren't product barcodes.
+            let productBarcode = barcodeResult.barcodes.first { candidate in
+                let symbology = candidate.symbology.lowercased()
+                return symbology.contains("ean13") || symbology.contains("ean8") || symbology.contains("upce")
+            }
+            var offResult: OpenFoodFactsProduct?
+            var offError: String?
+            if let payload = productBarcode?.payload {
+                do {
+                    offResult = try await off.lookup(payload)
+                } catch {
+                    offError = error.localizedDescription
+                }
+            }
+
+            // Run 4: fuse the signals above into a final verdict with the on-device LLM.
+            let outcome = await aggregator.aggregate(
+                containerType: detection,
+                ocr: ocrResult,
+                barcode: barcodeResult,
+                off: offResult,
+                bottleImage: bottleImage,
+                labelImage: labelImage
+            )
+            let diagnostics = PfandDiagnostics(ocrError: ocrError, barcodeError: barcodeError, offError: offError)
 
             resultFeedbackTrigger += 1
             withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) {
-                step = .result(bottle: bottleImage, label: labelImage, classification)
+                step = .result(bottle: bottleImage, label: labelImage, detection, ocrResult, barcodeResult, offResult, outcome, diagnostics)
             }
-
-            try? await Task.sleep(for: .seconds(15))
-            if case .result = step { reset() }
         } catch {
             showError(error.localizedDescription)
         }
